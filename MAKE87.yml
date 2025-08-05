@@ -36,12 +36,47 @@ interfaces:
               type: string
               enum: [ BEST_EFFORT, RELIABLE ]
               default: RELIABLE
+config:
+  type: object
+  properties:
+    video_source:
+      type: object
+      oneOf:
+        - title: "Predefined Video"
+          type: object
+          properties:
+            type:
+              type: string
+              const: predefined
+            selection:
+              type: string
+              enum:
+                - city_walk
+                - highway_traffic
+                - drone_flight
+              description: "Select from available predefined video samples"
+          required: [type, selection]
+          additionalProperties: false
+        - title: "Custom MP4 URL"
+          type: object
+          properties:
+            type:
+              type: string
+              const: custom_url
+            url:
+              type: string
+              format: uri
+              pattern: "^https?://.*\\.mp4$"
+              description: "HTTPS URL to your custom MP4 file"
+          required: [type, url]
+          additionalProperties: false
+      description: "Choose between predefined video samples or provide your own MP4 URL"
 container_config:
   environment:
     RUST_LOG: info
 build:
   build_kit:
-    name: rust
+    name: rust_av
 dev_build:
   build_kit:
-    name: rust
+    name: rust_av
