@@ -1,0 +1,47 @@
+version: 1
+interfaces:
+  - name: zenoh
+    protocol: zenoh
+    default_port:
+      name: zenoh
+      protocol: TCP
+      target_port: 7447
+    publishers:
+      - name: outgoing_message
+        spec:
+          make87_message: make87_messages.text.text_plain.PlainText
+        encoding: proto
+        config:
+          type: object
+          properties:
+            congestion_control:
+              type: string
+              enum: [ DROP, BLOCK ]
+              default: DROP
+            priority:
+              type: string
+              enum:
+                - REAL_TIME
+                - INTERACTIVE_HIGH
+                - INTERACTIVE_LOW
+                - DATA_HIGH
+                - DATA
+                - DATA_LOW
+                - BACKGROUND
+              default: DATA
+            express:
+              type: boolean
+              default: true
+            reliability:
+              type: string
+              enum: [ BEST_EFFORT, RELIABLE ]
+              default: RELIABLE
+container_config:
+  environment:
+    RUST_LOG: info
+build:
+  build_kit:
+    name: rust
+dev_build:
+  build_kit:
+    name: rust
