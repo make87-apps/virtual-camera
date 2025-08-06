@@ -147,16 +147,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let width = decoded.width();
                 let height = decoded.height();
 
-                // For YUV420P format, we need to extract Y, U, V planes
-                let y_data = decoded.data(0).to_vec();
-                let u_data = decoded.data(1).to_vec();
-                let v_data = decoded.data(2).to_vec();
+                // For YUV420P format, extract only the actual pixel data (not padding/stride)
+                let y_stride = decoded.stride(0);
+                let u_stride = decoded.stride(1);
+                let v_stride = decoded.stride(2);
 
-                // Combine all planes into a single data vector
+                let y_data = decoded.data(0);
+                let u_data = decoded.data(1);
+                let v_data = decoded.data(2);
+
+                // Extract only the actual pixel data for each plane
                 let mut combined_data = Vec::new();
-                combined_data.extend_from_slice(&y_data);
-                combined_data.extend_from_slice(&u_data);
-                combined_data.extend_from_slice(&v_data);
+
+                // Y plane: full resolution (width x height)
+                for row in 0..height {
+                    let start = (row as usize * y_stride);
+                    let end = start + width as usize;
+                    combined_data.extend_from_slice(&y_data[start..end]);
+                }
+
+                // U plane: quarter resolution (width/2 x height/2)
+                for row in 0..(height / 2) {
+                    let start = (row as usize * u_stride);
+                    let end = start + (width / 2) as usize;
+                    combined_data.extend_from_slice(&u_data[start..end]);
+                }
+
+                // V plane: quarter resolution (width/2 x height/2)
+                for row in 0..(height / 2) {
+                    let start = (row as usize * v_stride);
+                    let end = start + (width / 2) as usize;
+                    combined_data.extend_from_slice(&v_data[start..end]);
+                }
 
                 // Create headers with current timestamp
                 let mut header = base_header.clone();
