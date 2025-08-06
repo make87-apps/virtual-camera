@@ -77,7 +77,4 @@ container_config:
 build:
   build_kit:
     name: rust_av
-dev_build:
-  build_kit:
-    name: rust_av
 
