@@ -76,8 +76,8 @@ container_config:
     RUST_LOG: info
 build:
   build_kit:
-    name: rust_av
+    name: rust_a_v
 dev_build:
   build_kit:
-    name: rust_av
+    name: rust_a_v
 
