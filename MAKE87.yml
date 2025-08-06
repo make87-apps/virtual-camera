@@ -7,9 +7,9 @@ interfaces:
       protocol: TCP
       target_port: 7447
     publishers:
-      - name: outgoing_message
+      - name: raw_frames
         spec:
-          make87_message: make87_messages.text.text_plain.PlainText
+          make87_message: make87_messages.image.uncompressed.ImageRawAny
         encoding: proto
         config:
           type: object
