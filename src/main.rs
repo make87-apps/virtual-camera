@@ -13,15 +13,6 @@ use serde_json::Value;
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
-#[derive(Clone)]
-struct CachedFrame {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
-    pts: i64,
-    time_offset: f64, // Time offset from start of video
-}
-
 fn get_config_value<'a>(cfg: &'a ApplicationConfig, key: &str) -> Option<&'a Value> {
     cfg.config.get(key)
 }
@@ -91,11 +82,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize FFmpeg
     ffmpeg::init().unwrap();
 
-    log::info!("Starting initial video decode and caching...");
+    // Start wallclock and timing variables
+    let start_wallclock = Instant::now();
+    let mut start_pts = None;
+    let mut virtual_time_offset = 0.0; // Track cumulative video time for seamless loops
 
-    // PHASE 1: Decode entire video once and cache all frames
-    let cached_frames = {
-        let mut ictx = ffmpeg::format::input(&url)?;
+    // Stream, decode, and publish frames at wallclock speed - loop infinitely
+    loop {
+        // Reset for each loop iteration
+        let mut ictx = ffmpeg::format::input(&url).unwrap();
         let input = ictx
             .streams()
             .best(ffmpeg::media::Type::Video)
@@ -109,8 +104,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let time_base = input.time_base();
         let time_base_f64 = f64::from(time_base);
 
-        let mut frames = Vec::new();
-        let mut first_pts = None;
+        // Track the first PTS of this loop to calculate the offset
+        let mut loop_start_pts = None;
+        let mut last_pts = None;
 
         for (stream, packet) in ictx.packets() {
             if stream.index() != video_stream_index {
@@ -119,7 +115,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             let mut decoded = ffmpeg::util::frame::video::Video::empty();
             decoder.send_packet(&packet)?;
-
             while decoder.receive_frame(&mut decoded).is_ok() {
                 if decoded.width() == 0 || decoded.height() == 0 {
                     continue;
@@ -127,104 +122,93 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 let pts = decoded.pts().unwrap_or(0);
 
-                if first_pts.is_none() {
-                    first_pts = Some(pts);
+                // Initialize timing on the very first frame
+                if start_pts.is_none() {
+                    start_pts = Some(pts);
                 }
-                let first_pts_value = first_pts.unwrap();
 
-                // Calculate time offset from start of video
-                let time_offset = (pts - first_pts_value) as f64 * time_base_f64;
+                // Track the first PTS of this loop iteration
+                if loop_start_pts.is_none() {
+                    loop_start_pts = Some(pts);
+                }
 
-                // Extract YUV420 data
-                let width = decoded.width() as u32;
-                let height = decoded.height() as u32;
+                // Track the last PTS we processed
+                last_pts = Some(pts);
 
+                let loop_start_pts_value = loop_start_pts.unwrap();
+
+                // Calculate frame time within this loop iteration
+                let frame_time_in_loop = (pts - loop_start_pts_value) as f64 * time_base_f64;
+
+                // Add the virtual time offset for seamless looping
+                let total_video_time = virtual_time_offset + frame_time_in_loop;
+
+                // Extract frame data and create message (do all heavy work first)
+                let width = decoded.width();
+                let height = decoded.height();
+
+                // For YUV420P format, we need to extract Y, U, V planes
                 let y_data = decoded.data(0).to_vec();
                 let u_data = decoded.data(1).to_vec();
                 let v_data = decoded.data(2).to_vec();
 
+                // Combine all planes into a single data vector
                 let mut combined_data = Vec::new();
                 combined_data.extend_from_slice(&y_data);
                 combined_data.extend_from_slice(&u_data);
                 combined_data.extend_from_slice(&v_data);
 
-                frames.push(CachedFrame {
+                // Create headers with current timestamp
+                let mut header = base_header.clone();
+                header.timestamp = Some(Timestamp::get_current_time());
+
+                // Create YUV420 image message
+                let yuv420_image = ImageYuv420 {
+                    header: Some(header.clone()),
                     width,
                     height,
                     data: combined_data,
+                };
+
+                // Create ImageRawAny message
+                let image_any = ImageRawAny {
+                    header: Some(header),
+                    image: Some(Image::Yuv420(yuv420_image)),
+                };
+
+                // Encode the message (do this before timing check)
+                let message_encoded = message_encoder.encode(&image_any)?;
+
+                // NOW wait for the right time to publish
+                let elapsed_since_start = start_wallclock.elapsed().as_secs_f64();
+                if total_video_time > elapsed_since_start {
+                    let wait_time = total_video_time - elapsed_since_start;
+                    sleep(Duration::from_secs_f64(wait_time)).await;
+                }
+
+                // Publish immediately when the time is right
+                publisher.put(&message_encoded).await?;
+
+                log::info!(
+                    "Published YUV420 frame {}x{} PTS={} total_video_time={:.3}s (wallclock elapsed={:.3}s)",
+                    width,
+                    height,
                     pts,
-                    time_offset,
-                });
-
-                log::debug!("Cached frame {} at time {:.3}s", frames.len(), time_offset);
+                    total_video_time,
+                    elapsed_since_start
+                );
             }
         }
 
-        log::info!("Cached {} frames, total duration: {:.3}s", frames.len(),
-                   frames.last().map(|f| f.time_offset).unwrap_or(0.0));
-        frames
-    };
-
-    if cached_frames.is_empty() {
-        return Err("No frames could be decoded from video".into());
-    }
-
-    let video_duration = cached_frames.last().unwrap().time_offset;
-
-    // PHASE 2: Replay cached frames in infinite loop
-    let start_wallclock = Instant::now();
-    let mut virtual_time_offset = 0.0;
-
-    log::info!("Starting infinite playback loop...");
-
-    loop {
-        for frame in &cached_frames {
-            let total_video_time = virtual_time_offset + frame.time_offset;
-
-            // Create headers with current timestamp
-            let mut header = base_header.clone();
-            header.timestamp = Some(Timestamp::get_current_time());
-
-            // Create YUV420 image message from cached data
-            let yuv420_image = ImageYuv420 {
-                header: Some(header.clone()),
-                width: frame.width,
-                height: frame.height,
-                data: frame.data.clone(),
-            };
-
-            // Create ImageRawAny message
-            let image_any = ImageRawAny {
-                header: Some(header),
-                image: Some(Image::Yuv420(yuv420_image)),
-            };
-
-            // Encode the message
-            let message_encoded = message_encoder.encode(&image_any)?;
-
-            // Wait for the right time to publish
-            let elapsed_since_start = start_wallclock.elapsed().as_secs_f64();
-            if total_video_time > elapsed_since_start {
-                let wait_time = total_video_time - elapsed_since_start;
-                sleep(Duration::from_secs_f64(wait_time)).await;
-            }
-
-            // Publish immediately when the time is right
-            publisher.put(&message_encoded).await?;
-
-            log::info!(
-                "Published cached frame {}x{} PTS={} total_video_time={:.3}s (wallclock elapsed={:.3}s)",
-                frame.width,
-                frame.height,
-                frame.pts,
-                total_video_time,
-                elapsed_since_start
-            );
+        // Calculate the actual duration of this loop iteration
+        if let (Some(loop_start), Some(last)) = (loop_start_pts, last_pts) {
+            let actual_loop_duration = (last - loop_start) as f64 * time_base_f64;
+            virtual_time_offset += actual_loop_duration;
+            log::info!("Loop completed. Actual duration: {:.3}s", actual_loop_duration);
         }
 
-        // Update virtual time offset for seamless looping
-        virtual_time_offset += video_duration;
-        log::info!("Loop completed. Restarting seamlessly... (virtual_time_offset: {:.3}s)", virtual_time_offset);
+        // End of stream reached, log and continue to next iteration (restart)
+        log::info!("End of stream reached, restarting video loop seamlessly... (virtual_time_offset: {:.3}s)", virtual_time_offset);
     }
 
 }
