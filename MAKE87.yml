@@ -51,9 +51,13 @@ config:
             selection:
               type: string
               enum:
-                - city_walk
-                - highway_traffic
-                - drone_flight
+                - city_walk_1080
+                - city_walk_4k
+                - highway_traffic_1080
+                - highway_traffic_4k
+                - drone_flight_1080
+                - drone_flight_4k
+              default: city_walk_1080
               description: "Select from available predefined video samples"
           required: [type, selection]
           additionalProperties: false

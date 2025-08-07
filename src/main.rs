@@ -32,9 +32,12 @@ fn resolve_video_url(video_source: &Value) -> Result<String, Box<dyn Error + Sen
                 .ok_or("Missing selection for predefined video")?;
 
             let url = match selection {
-                "city_walk" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/city_walk.mp4",
-                "highway_traffic" => "https://make87-assets.nyc3.digitaloceanspaces.com/videos/highway_traffic.mp4",
-                "drone_flight" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/drone_flight.mp4",
+                "city_walk_4k" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/city_walk.mp4",
+                "city_walk_1080" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/city_walk_1080.mp4",
+                "highway_traffic_4k" => "https://make87-assets.nyc3.digitaloceanspaces.com/videos/highway_traffic.mp4",
+                "highway_traffic_1080" => "https://make87-assets.nyc3.digitaloceanspaces.com/videos/highway_traffic_1080.mp4",
+                "drone_flight_4k" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/drone_flight.mp4",
+                "drone_flight_1080" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/drone_flight_1080.mp4",
                 _ => return Err(format!("Unknown predefined video selection: {}", selection).into()),
             };
 
