@@ -134,10 +134,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         // Track the first PTS of this loop to calculate the offset
         let mut loop_start_pts = None;
         let mut last_pts = None;
+        let mut packet_count = 0;
+        let mut last_packet_time = Instant::now();
 
         for (stream, packet) in ictx.packets() {
             if stream.index() != video_stream_index {
                 continue;
+            }
+
+            packet_count += 1;
+            let current_time = Instant::now();
+
+            // If we haven't received a video packet in 5 seconds, assume stream is stuck
+            if current_time.duration_since(last_packet_time).as_secs() > 5 {
+                log::warn!("No video packets received for 5 seconds, restarting stream...");
+                break;
+            }
+            last_packet_time = current_time;
+
+            // If we've processed too many packets without progress, break
+            if packet_count > 1000 && loop_start_pts.is_none() {
+                log::warn!("Processed {} packets without any valid frames, restarting stream...", packet_count);
+                break;
             }
 
             let mut decoded = ffmpeg::util::frame::video::Video::empty();
@@ -152,6 +170,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 if decoded.width() == 0 || decoded.height() == 0 {
                     continue;
                 }
+
+                // Reset packet monitoring since we got a valid frame
+                packet_count = 0;
+                last_packet_time = current_time;
 
                 // Always use a separate output_frame variable
                 let mut output_frame = ffmpeg::util::frame::video::Video::empty();
