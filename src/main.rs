@@ -7,6 +7,9 @@ use make87_messages::image::uncompressed::image_raw_any::Image;
 use make87_messages::image::uncompressed::ImageYuv420;
 use make87_messages::core::Header;
 use std::error::Error;
+use std::fmt::format;
+use std::fs::File;
+use std::io::Write;
 use make87::models::ApplicationConfig;
 use make87_messages::google::protobuf::Timestamp;
 use serde_json::Value;
@@ -104,6 +107,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let time_base = input.time_base();
         let time_base_f64 = f64::from(time_base);
 
+        // Prepare scaler for YUV420p conversion (will be initialized lazily)
+        let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
+
         // Track the first PTS of this loop to calculate the offset
         let mut loop_start_pts = None;
         let mut last_pts = None;
@@ -120,7 +126,35 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     continue;
                 }
 
-                let pts = decoded.pts().unwrap_or(0);
+                // Always use a separate output_frame variable
+                let mut output_frame = ffmpeg::util::frame::video::Video::empty();
+
+                if decoded.format() != ffmpeg::format::Pixel::YUV420P {
+                    // Lazily initialize scaler
+                    if scaler.is_none() {
+                        scaler = Some(
+                            ffmpeg::software::scaling::Context::get(
+                                decoded.format(),
+                                decoded.width(),
+                                decoded.height(),
+                                ffmpeg::format::Pixel::YUV420P,
+                                decoded.width(),
+                                decoded.height(),
+                                ffmpeg::software::scaling::flag::Flags::BILINEAR,
+                            )?
+                        );
+                    }
+                    scaler.as_mut().unwrap().run(&decoded, &mut output_frame)?;
+                    // Preserve PTS from original frame
+                    output_frame.set_pts(decoded.pts());
+                } else {
+                    // Copy decoded into output_frame without clone
+                    std::mem::swap(&mut output_frame, &mut decoded);
+                }
+
+                let frame = &output_frame;
+
+                let pts = frame.pts().unwrap_or(0); // Add fallback to 0 for safety
 
                 // Initialize timing on the very first frame
                 if start_pts.is_none() {
@@ -144,38 +178,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let total_video_time = virtual_time_offset + frame_time_in_loop;
 
                 // Extract frame data and create message (do all heavy work first)
-                let width = decoded.width();
-                let height = decoded.height();
+                let width = frame.width();
+                let height = frame.height();
 
                 // For YUV420P format, extract only the actual pixel data (not padding/stride)
-                let y_stride = decoded.stride(0);
-                let u_stride = decoded.stride(1);
-                let v_stride = decoded.stride(2);
+                let y_stride = frame.stride(0);
+                let u_stride = frame.stride(1);
+                let v_stride = frame.stride(2);
 
-                let y_data = decoded.data(0);
-                let u_data = decoded.data(1);
-                let v_data = decoded.data(2);
+                let y_data = frame.data(0);
+                let u_data = frame.data(1);
+                let v_data = frame.data(2);
 
                 // Extract only the actual pixel data for each plane
                 let mut combined_data = Vec::new();
 
                 // Y plane: full resolution (width x height)
                 for row in 0..height {
-                    let start = (row as usize * y_stride);
+                    let start = row as usize * y_stride;
                     let end = start + width as usize;
                     combined_data.extend_from_slice(&y_data[start..end]);
                 }
 
                 // U plane: quarter resolution (width/2 x height/2)
                 for row in 0..(height / 2) {
-                    let start = (row as usize * u_stride);
+                    let start = row as usize * u_stride;
                     let end = start + (width / 2) as usize;
                     combined_data.extend_from_slice(&u_data[start..end]);
                 }
 
                 // V plane: quarter resolution (width/2 x height/2)
                 for row in 0..(height / 2) {
-                    let start = (row as usize * v_stride);
+                    let start = row as usize * v_stride;
                     let end = start + (width / 2) as usize;
                     combined_data.extend_from_slice(&v_data[start..end]);
                 }
