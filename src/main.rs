@@ -93,195 +93,230 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Stream, decode, and publish frames at wallclock speed - loop infinitely
     loop {
         // Reset for each loop iteration
-        let stream_result = async {
-            let mut ictx = ffmpeg::format::input(&url)?;
-            let input = ictx
-                .streams()
-                .best(ffmpeg::media::Type::Video)
-                .ok_or("Could not find video stream")?;
-            let video_stream_index = input.index();
-            let codec_params = input.parameters();
-            let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)?
-                .decoder()
-                .video()?;
+        let ictx_result = ffmpeg::format::input(&url);
+        let mut ictx = match ictx_result {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                log::warn!("Failed to open stream: {:?}. Retrying in 1 second...", e);
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
 
-            let time_base = input.time_base();
-            let time_base_f64 = f64::from(time_base);
+        let input = match ictx.streams().best(ffmpeg::media::Type::Video) {
+            Some(stream) => stream,
+            None => {
+                log::warn!("Could not find video stream. Retrying in 1 second...");
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
 
-            // Prepare scaler for YUV420p conversion (will be initialized lazily)
-            let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
+        let video_stream_index = input.index();
+        let codec_params = input.parameters();
+        let decoder_result = ffmpeg::codec::context::Context::from_parameters(codec_params)
+            .and_then(|ctx| ctx.decoder().video());
+        let mut decoder = match decoder_result {
+            Ok(dec) => dec,
+            Err(e) => {
+                log::warn!("Failed to create decoder: {:?}. Retrying in 1 second...", e);
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
 
-            // Track the first PTS of this loop to calculate the offset
-            let mut loop_start_pts = None;
-            let mut last_pts = None;
+        let time_base = input.time_base();
+        let time_base_f64 = f64::from(time_base);
 
-            for (stream, packet) in ictx.packets() {
-                if stream.index() != video_stream_index {
+        // Prepare scaler for YUV420p conversion (will be initialized lazily)
+        let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
+
+        // Track the first PTS of this loop to calculate the offset
+        let mut loop_start_pts = None;
+        let mut last_pts = None;
+
+        for (stream, packet) in ictx.packets() {
+            if stream.index() != video_stream_index {
+                continue;
+            }
+
+            let mut decoded = ffmpeg::util::frame::video::Video::empty();
+
+            // Handle decoder errors gracefully - just break and restart stream
+            if decoder.send_packet(&packet).is_err() {
+                log::warn!("Packet decode error, restarting stream...");
+                break;
+            }
+
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                if decoded.width() == 0 || decoded.height() == 0 {
                     continue;
                 }
 
-                let mut decoded = ffmpeg::util::frame::video::Video::empty();
+                // Always use a separate output_frame variable
+                let mut output_frame = ffmpeg::util::frame::video::Video::empty();
 
-                // Handle decoder errors gracefully
-                if let Err(e) = decoder.send_packet(&packet) {
-                    log::warn!("Error sending packet to decoder: {:?}", e);
-                    return Err(e.into());
+                // Handle frame conversion errors - if it fails, skip this frame
+                let conversion_result = if decoded.format() != ffmpeg::format::Pixel::YUV420P {
+                    // Lazily initialize scaler
+                    if scaler.is_none() {
+                        match ffmpeg::software::scaling::Context::get(
+                            decoded.format(),
+                            decoded.width(),
+                            decoded.height(),
+                            ffmpeg::format::Pixel::YUV420P,
+                            decoded.width(),
+                            decoded.height(),
+                            ffmpeg::software::scaling::flag::Flags::BILINEAR,
+                        ) {
+                            Ok(ctx) => scaler = Some(ctx),
+                            Err(e) => {
+                                log::warn!("Failed to create scaler, skipping frame: {:?}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    match scaler.as_mut().unwrap().run(&decoded, &mut output_frame) {
+                        Ok(_) => {
+                            // Preserve PTS from original frame
+                            output_frame.set_pts(decoded.pts());
+                            Ok(())
+                        }
+                        Err(e) => Err(e)
+                    }
+                } else {
+                    // Copy decoded into output_frame without clone
+                    std::mem::swap(&mut output_frame, &mut decoded);
+                    Ok(())
+                };
+
+                // If conversion failed, skip this frame
+                if conversion_result.is_err() {
+                    log::warn!("Frame conversion failed, skipping frame: {:?}", conversion_result.unwrap_err());
+                    continue;
                 }
 
-                while decoder.receive_frame(&mut decoded).is_ok() {
-                    if decoded.width() == 0 || decoded.height() == 0 {
+                let frame = &output_frame;
+
+                let pts = frame.pts().unwrap_or(0);
+
+                // Initialize timing on the very first frame
+                if start_pts.is_none() {
+                    start_pts = Some(pts);
+                }
+
+                // Track the first PTS of this loop iteration
+                if loop_start_pts.is_none() {
+                    loop_start_pts = Some(pts);
+                }
+
+                // Track the last PTS we processed
+                last_pts = Some(pts);
+
+                let loop_start_pts_value = loop_start_pts.unwrap();
+
+                // Calculate frame time within this loop iteration
+                let frame_time_in_loop = (pts - loop_start_pts_value) as f64 * time_base_f64;
+
+                // Add the virtual time offset for seamless looping
+                let total_video_time = virtual_time_offset + frame_time_in_loop;
+
+                // Extract frame data and create message (do all heavy work first)
+                let width = frame.width();
+                let height = frame.height();
+
+                // For YUV420P format, extract only the actual pixel data (not padding/stride)
+                let y_stride = frame.stride(0);
+                let u_stride = frame.stride(1);
+                let v_stride = frame.stride(2);
+
+                let y_data = frame.data(0);
+                let u_data = frame.data(1);
+                let v_data = frame.data(2);
+
+                // Extract only the actual pixel data for each plane
+                let mut combined_data = Vec::new();
+
+                // Y plane: full resolution (width x height)
+                for row in 0..height {
+                    let start = row as usize * y_stride;
+                    let end = start + width as usize;
+                    combined_data.extend_from_slice(&y_data[start..end]);
+                }
+
+                // U plane: quarter resolution (width/2 x height/2)
+                for row in 0..(height / 2) {
+                    let start = row as usize * u_stride;
+                    let end = start + (width / 2) as usize;
+                    combined_data.extend_from_slice(&u_data[start..end]);
+                }
+
+                // V plane: quarter resolution (width/2 x height/2)
+                for row in 0..(height / 2) {
+                    let start = row as usize * v_stride;
+                    let end = start + (width / 2) as usize;
+                    combined_data.extend_from_slice(&v_data[start..end]);
+                }
+
+                // Create headers with current timestamp
+                let mut header = base_header.clone();
+                header.timestamp = Some(Timestamp::get_current_time());
+
+                // Create YUV420 image message
+                let yuv420_image = ImageYuv420 {
+                    header: Some(header.clone()),
+                    width,
+                    height,
+                    data: combined_data,
+                };
+
+                // Create ImageRawAny message
+                let image_any = ImageRawAny {
+                    header: Some(header),
+                    image: Some(Image::Yuv420(yuv420_image)),
+                };
+
+                // Encode the message (do this before timing check)
+                let message_encoded = match message_encoder.encode(&image_any) {
+                    Ok(encoded) => encoded,
+                    Err(e) => {
+                        log::warn!("Failed to encode message, skipping frame: {:?}", e);
                         continue;
                     }
+                };
 
-                    // Always use a separate output_frame variable
-                    let mut output_frame = ffmpeg::util::frame::video::Video::empty();
-
-                    if decoded.format() != ffmpeg::format::Pixel::YUV420P {
-                        // Lazily initialize scaler
-                        if scaler.is_none() {
-                            scaler = Some(
-                                ffmpeg::software::scaling::Context::get(
-                                    decoded.format(),
-                                    decoded.width(),
-                                    decoded.height(),
-                                    ffmpeg::format::Pixel::YUV420P,
-                                    decoded.width(),
-                                    decoded.height(),
-                                    ffmpeg::software::scaling::flag::Flags::BILINEAR,
-                                )?
-                            );
-                        }
-                        scaler.as_mut().unwrap().run(&decoded, &mut output_frame)?;
-                        // Preserve PTS from original frame
-                        output_frame.set_pts(decoded.pts());
-                    } else {
-                        // Copy decoded into output_frame without clone
-                        std::mem::swap(&mut output_frame, &mut decoded);
-                    }
-
-                    let frame = &output_frame;
-
-                    let pts = frame.pts().unwrap_or(0); // Add fallback to 0 for safety
-
-                    // Initialize timing on the very first frame
-                    if start_pts.is_none() {
-                        start_pts = Some(pts);
-                    }
-
-                    // Track the first PTS of this loop iteration
-                    if loop_start_pts.is_none() {
-                        loop_start_pts = Some(pts);
-                    }
-
-                    // Track the last PTS we processed
-                    last_pts = Some(pts);
-
-                    let loop_start_pts_value = loop_start_pts.unwrap();
-
-                    // Calculate frame time within this loop iteration
-                    let frame_time_in_loop = (pts - loop_start_pts_value) as f64 * time_base_f64;
-
-                    // Add the virtual time offset for seamless looping
-                    let total_video_time = virtual_time_offset + frame_time_in_loop;
-
-                    // Extract frame data and create message (do all heavy work first)
-                    let width = frame.width();
-                    let height = frame.height();
-
-                    // For YUV420P format, extract only the actual pixel data (not padding/stride)
-                    let y_stride = frame.stride(0);
-                    let u_stride = frame.stride(1);
-                    let v_stride = frame.stride(2);
-
-                    let y_data = frame.data(0);
-                    let u_data = frame.data(1);
-                    let v_data = frame.data(2);
-
-                    // Extract only the actual pixel data for each plane
-                    let mut combined_data = Vec::new();
-
-                    // Y plane: full resolution (width x height)
-                    for row in 0..height {
-                        let start = row as usize * y_stride;
-                        let end = start + width as usize;
-                        combined_data.extend_from_slice(&y_data[start..end]);
-                    }
-
-                    // U plane: quarter resolution (width/2 x height/2)
-                    for row in 0..(height / 2) {
-                        let start = row as usize * u_stride;
-                        let end = start + (width / 2) as usize;
-                        combined_data.extend_from_slice(&u_data[start..end]);
-                    }
-
-                    // V plane: quarter resolution (width/2 x height/2)
-                    for row in 0..(height / 2) {
-                        let start = row as usize * v_stride;
-                        let end = start + (width / 2) as usize;
-                        combined_data.extend_from_slice(&v_data[start..end]);
-                    }
-
-                    // Create headers with current timestamp
-                    let mut header = base_header.clone();
-                    header.timestamp = Some(Timestamp::get_current_time());
-
-                    // Create YUV420 image message
-                    let yuv420_image = ImageYuv420 {
-                        header: Some(header.clone()),
-                        width,
-                        height,
-                        data: combined_data,
-                    };
-
-                    // Create ImageRawAny message
-                    let image_any = ImageRawAny {
-                        header: Some(header),
-                        image: Some(Image::Yuv420(yuv420_image)),
-                    };
-
-                    // Encode the message (do this before timing check)
-                    let message_encoded = message_encoder.encode(&image_any)?;
-
-                    // NOW wait for the right time to publish
-                    let elapsed_since_start = start_wallclock.elapsed().as_secs_f64();
-                    if total_video_time > elapsed_since_start {
-                        let wait_time = total_video_time - elapsed_since_start;
-                        sleep(Duration::from_secs_f64(wait_time)).await;
-                    }
-
-                    // Publish immediately when the time is right
-                    publisher.put(&message_encoded).await?;
-
-                    log::info!(
-                        "Published YUV420 frame {}x{} PTS={} total_video_time={:.3}s (wallclock elapsed={:.3}s)",
-                        width,
-                        height,
-                        pts,
-                        total_video_time,
-                        elapsed_since_start
-                    );
+                // NOW wait for the right time to publish
+                let elapsed_since_start = start_wallclock.elapsed().as_secs_f64();
+                if total_video_time > elapsed_since_start {
+                    let wait_time = total_video_time - elapsed_since_start;
+                    sleep(Duration::from_secs_f64(wait_time)).await;
                 }
-            }
 
-            // Calculate the actual duration of this loop iteration
-            if let (Some(loop_start), Some(last)) = (loop_start_pts, last_pts) {
-                let actual_loop_duration = (last - loop_start) as f64 * time_base_f64;
-                virtual_time_offset += actual_loop_duration;
-                log::info!("Loop completed. Actual duration: {:.3}s", actual_loop_duration);
-            }
+                // Publish immediately when the time is right
+                if let Err(e) = publisher.put(&message_encoded).await {
+                    log::warn!("Failed to publish frame: {:?}", e);
+                    continue;
+                }
 
-            Ok::<(), Box<dyn Error + Send + Sync>>(())
-        }.await;
-
-        match stream_result {
-            Ok(_) => {
-                log::info!("Stream ended normally, restarting video loop seamlessly... (virtual_time_offset: {:.3}s)", virtual_time_offset);
-            }
-            Err(e) => {
-                log::warn!("Stream error occurred: {:?}. Restarting stream in 1 second... (virtual_time_offset: {:.3}s)", e, virtual_time_offset);
-                sleep(Duration::from_secs(1)).await;
+                log::info!(
+                    "Published YUV420 frame {}x{} PTS={} total_video_time={:.3}s (wallclock elapsed={:.3}s)",
+                    width,
+                    height,
+                    pts,
+                    total_video_time,
+                    elapsed_since_start
+                );
             }
         }
+
+        // Calculate the actual duration of this loop iteration and preserve offset
+        if let (Some(loop_start), Some(last)) = (loop_start_pts, last_pts) {
+            let actual_loop_duration = (last - loop_start) as f64 * time_base_f64;
+            virtual_time_offset += actual_loop_duration;
+            log::info!("Loop completed. Actual duration: {:.3}s", actual_loop_duration);
+        }
+
+        log::info!("Stream ended, restarting video loop seamlessly... (virtual_time_offset: {:.3}s)", virtual_time_offset);
     }
 
 }
