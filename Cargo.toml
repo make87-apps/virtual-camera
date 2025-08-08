@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 env_logger = "0.11.8"
-ffmpeg-next = "7.1.0"
+ffmpeg-next = { version = "7.1.0", default-features = false, features = ["format", "codec", "software-scaling"]}
 log = "0.4.27"
 make87 = { version = ">=0.1.0", features = ["zenoh", "protobuf"] }
 make87_messages = ">=0.2.8"

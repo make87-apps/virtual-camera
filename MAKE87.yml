@@ -79,8 +79,5 @@ container_config:
   environment:
     RUST_LOG: info
 build:
-  build_kit:
-    name: rust_av
-dev_build:
-  build_kit:
-    name: rust_av
+  custom:
+    dockerfile: build_kit/Dockerfile
