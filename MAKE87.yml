@@ -77,7 +77,7 @@ config:
       description: "Choose between predefined video samples or provide your own MP4 URL"
 container_config:
   environment:
-    RUST_LOG: info
+#    RUST_LOG: info
 build:
   custom:
     dockerfile: build_kit/Dockerfile
