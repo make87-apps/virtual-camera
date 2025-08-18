@@ -17,6 +17,8 @@ fn get_config_value<'a>(cfg: &'a ApplicationConfig, key: &str) -> Option<&'a Val
     cfg.config.get(key)
 }
 
+
+
 fn resolve_video_url(video_source: &Value) -> Result<String, Box<dyn Error + Send + Sync>> {
     let source_type = video_source.get("type")
         .and_then(|v| v.as_str())
@@ -31,8 +33,8 @@ fn resolve_video_url(video_source: &Value) -> Result<String, Box<dyn Error + Sen
             let url = match selection {
                 "city_walk_4k" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/city_walk.mp4",
                 "city_walk_1080" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/city_walk_1080.mp4",
-                "highway_traffic_4k" => "https://make87-assets.nyc3.digitaloceanspaces.com/videos/highway_traffic.mp4",
-                "highway_traffic_1080" => "https://make87-assets.nyc3.digitaloceanspaces.com/videos/highway_traffic_1080.mp4",
+                "highway_traffic_4k" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/highway_traffic.mp4",
+                "highway_traffic_1080" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/highway_traffic_1080.mp4",
                 "drone_flight_4k" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/drone_flight.mp4",
                 "drone_flight_1080" => "https://make87-files.nyc3.digitaloceanspaces.com/example-apps/virtual-camera/drone_flight_1080.mp4",
                 _ => return Err(format!("Unknown predefined video selection: {}", selection).into()),
