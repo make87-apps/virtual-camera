@@ -1,4 +1,5 @@
 use ffmpeg_next as ffmpeg;
+use futures_util::StreamExt;
 use make87::config::load_config_from_default_env;
 use make87::encodings::{Encoder, ProtobufEncoder};
 use make87::interfaces::zenoh::ZenohInterface;
@@ -8,8 +9,13 @@ use make87_messages::google::protobuf::Timestamp;
 use make87_messages::image::uncompressed::image_raw_any::Image;
 use make87_messages::image::uncompressed::ImageRawAny;
 use make87_messages::image::uncompressed::ImageYuv420;
+use reqwest;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::error::Error;
+use std::path::Path;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
@@ -18,6 +24,95 @@ fn get_config_value<'a>(cfg: &'a ApplicationConfig, key: &str) -> Option<&'a Val
 }
 
 
+
+fn get_url_hash(url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+async fn ensure_cache_dir() -> Result<(), Box<dyn Error + Send + Sync>> {
+    fs::create_dir_all("cache").await?;
+    Ok(())
+}
+
+async fn get_remote_file_size(url: &str) -> Result<Option<u64>, Box<dyn Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let response = client.head(url).send().await?;
+    
+    if response.status().is_success() {
+        Ok(response.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|s| s.parse().ok()))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn download_file(url: &str, file_path: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    log::info!("Downloading {} to {}", url, file_path);
+    
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await?;
+    
+    if !response.status().is_success() {
+        return Err(format!("Failed to download file: HTTP {}", response.status()).into());
+    }
+    
+    let mut file = fs::File::create(file_path).await?;
+    let mut stream = response.bytes_stream();
+    
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+    }
+    
+    file.flush().await?;
+    log::info!("Downloaded {} successfully", file_path);
+    Ok(())
+}
+
+async fn get_cached_file_path(url: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    ensure_cache_dir().await?;
+    
+    let url_hash = get_url_hash(url);
+    let file_extension = Path::new(url)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("mp4");
+    let cache_file_path = format!("/cache/{}.{}", url_hash, file_extension);
+    
+    // Check if file exists and validate size
+    if Path::new(&cache_file_path).exists() {
+        let local_size = fs::metadata(&cache_file_path).await?.len();
+        
+        // Check remote file size
+        match get_remote_file_size(url).await {
+            Ok(Some(remote_size)) => {
+                if local_size == remote_size {
+                    log::info!("Using cached file: {} ({})", cache_file_path, url);
+                    return Ok(cache_file_path);
+                } else {
+                    log::warn!("Cache file size mismatch. Local: {}, Remote: {}. Re-downloading.", local_size, remote_size);
+                    fs::remove_file(&cache_file_path).await?;
+                }
+            },
+            Ok(None) => {
+                log::warn!("Could not get remote file size, using cached file anyway");
+                return Ok(cache_file_path);
+            },
+            Err(e) => {
+                log::warn!("Error checking remote file size: {}. Using cached file.", e);
+                return Ok(cache_file_path);
+            }
+        }
+    }
+    
+    // Download the file
+    download_file(url, &cache_file_path).await?;
+    Ok(cache_file_path)
+}
 
 fn resolve_video_url(video_source: &Value) -> Result<String, Box<dyn Error + Send + Sync>> {
     let source_type = video_source.get("type")
@@ -67,6 +162,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Resolve video URL
     let url = resolve_video_url(video_source)?;
 
+    // Download and cache the video file
+    let local_file_path = get_cached_file_path(&url).await?;
+    log::info!("Using local file: {}", local_file_path);
+
     // Generate entity path with short random UUID
     let short_uuid = Uuid::new_v4().to_string()[..8].to_string();
     let entity_path = format!("/virtual_camera_{}", short_uuid);
@@ -95,7 +194,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Stream, decode, and publish frames at wallclock speed - loop infinitely
     loop {
         // Reset for each loop iteration
-        let ictx_result = ffmpeg::format::input(&url);
+        let ictx_result = ffmpeg::format::input(&local_file_path);
         let mut ictx = match ictx_result {
             Ok(ctx) => ctx,
             Err(e) => {

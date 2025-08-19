@@ -6,6 +6,7 @@ A make87 application that provides a virtual camera stream by decoding MP4 video
 
 This application transforms any MP4 video into a continuous virtual camera feed that:
 
+- **Caches video files locally** for reliable streaming (initial download may take time depending on file size and internet connection)
 - **Decodes MP4 videos** using software decoding (FFmpeg)
 - **Extracts YUV420 frames** without unnecessary color space conversions
 - **Publishes frames** via Zenoh using the `ImageRawAny` message format
@@ -14,6 +15,16 @@ This application transforms any MP4 video into a continuous virtual camera feed 
 - **Generates unique entity paths** for each instance using random UUIDs
 
 The virtual camera appears as a continuous, never-ending video stream to any make87 components subscribing to the published frames.
+
+## Local Caching
+
+The application automatically downloads and caches video files in a local `cache/` directory before streaming begins. This provides several benefits:
+
+- **Reliable streaming** - No network interruptions or corruption during playback
+- **Faster subsequent runs** - Cached files are reused until the remote file changes
+- **Bandwidth efficiency** - Files are only downloaded when updated
+
+⚠️ **Initial startup time**: The first run will include a download phase that depends on file size and internet connection speed. Large 4K videos may take several minutes to download on slower connections.
 
 ## Output
 

@@ -75,6 +75,9 @@ config:
           required: [type, url]
           additionalProperties: false
       description: "Choose between predefined video samples or provide your own MP4 URL"
+container_config:
+  volumes:
+    - virtual_camera_cache:/cache:rw
 build:
   custom:
     dockerfile: build_kit/Dockerfile

@@ -6,9 +6,12 @@ edition = "2021"
 [dependencies]
 env_logger = "0.11.8"
 ffmpeg-next = { version = "7.1.0", default-features = false, features = ["format", "codec", "software-scaling"]}
+futures-util = "0.3"
 log = "0.4.27"
 make87 = { version = ">=0.1.0", features = ["zenoh", "protobuf"] }
 make87_messages = ">=0.2.8"
+reqwest = { version = "0.11", features = ["stream"] }
 serde_json = "1.0"
-tokio = { version = "1.44.1",  features = ["rt-multi-thread", "macros", "time"] }
+sha2 = "0.10"
+tokio = { version = "1.44.1",  features = ["rt-multi-thread", "macros", "time", "fs"] }
 uuid = { version = "1.0", features = ["v4"] }
